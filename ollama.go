@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -9,7 +10,10 @@ import (
 	"time"
 	"strings"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/robfig/cron"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 
@@ -55,28 +59,101 @@ type modelsResponse struct {
 	} `json:"models"`
 }
 
-// Custom metrics handler that refreshes model data before serving metrics
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
+var (
+	meter = otel.Meter("github.com/daysa-silva/ollama-opentelmetry-metrics")
+	loadedModels metric.Int64Gauge
+	modelRAM metric.Int64Gauge
+	// loadedModelInfo metric.Int64Gauge
+	promptTokens metric.Int64Counter
+	generatedTokens metric.Int64Counter
+	// requestDuration metric.Float64Histogram
+	// timePerToken metric.Float64Histogram
+)
+
+// Initialize the metrics and register them with OpenTelemetry
+func init() {
+	var err error
+
+	loadedModels, err = meter.Int64Gauge(
+		"ollama.loaded.models",
+		metric.WithDescription(
+			"Number of models currently loaded in memory in Ollama",
+		),
+		metric.WithUnit("{models}"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	modelRAM, err = meter.Int64Gauge(
+		"ollama.model.ram",
+		metric.WithDescription(
+			"RAM usage in megabytes for each loaded model",
+		),
+		metric.WithUnit("By"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	// loadedModelInfo, err = meter.Int64Gauge(
+	// 	"ollama.model.loaded",
+	// 	metric.WithDescription(
+	// 		"Indicator (1/0) if a model is loaded in memory",
+	// 	),
+	// )
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	promptTokens, err = meter.Int64Counter(
+		"ollama.prompt.tokens",
+		metric.WithDescription(
+			"Total number of prompt tokens processed by Ollama",
+		),
+		metric.WithUnit("{tokens}"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	generatedTokens , err = meter.Int64Counter(
+		"ollama.generated.tokens",
+		metric.WithDescription(
+			"Total number of tokens generated processed by Ollama",
+		),
+		metric.WithUnit("{tokens}"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	// Criar cron para rodar a cada 30 segundos e atualizar as métricas do tipo Gauge
+	c := cron.New()
+	c.AddFunc("@every 30s", calculateGaugeMetrics)
+	c.Start()
+
+}
+
+func calculateGaugeMetrics() {
+	ctx := context.Background()
+
 	upstreamAddr := getUpstreamAddr()
 
+	resp, err := upstreamClient.Get(upstreamAddr + "/api/ps")
+
 	// Refresh model information from /api/ps before serving metrics
-	if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
+	if  err == nil {
 		var ps psResponse
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if jsonErr := json.Unmarshal(data, &ps); jsonErr == nil {
-			loadedModelsGauge.Set(float64(len(ps.Models)))
-			loadedModelInfo.Reset()
-			modelRAMUsage.Reset() // Reset RAM usage before updating
-			
+			loadedModels.Record(ctx, int64(len(ps.Models)))
+
 			// Update model metrics directly from ps response
 			for _, m := range ps.Models {
 				modelName := ensureModelTag(m.Name)
-				loadedModelInfo.WithLabelValues(modelName).Set(1)
-				
-				// Convert size from bytes to megabytes
-				ramMB := float64(m.Size) / (1024 * 1024)
-				modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
+				modelRAM.Record(ctx, m.Size, metric.WithAttributes(attribute.String("model.name", ensureModelTag(modelName))))
 			}
 			log.Printf("Refreshed metrics data: %d models loaded", len(ps.Models))
 		} else {
@@ -85,20 +162,14 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("ERROR refreshing model metrics: %v", err)
 	}
-	
-	// Serve metrics using the standard Prometheus handler
-	promhttp.Handler().ServeHTTP(w, r)
 }
+
 
 // All other paths -> proxy handler
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
 	upstreamAddr := getUpstreamAddr()
 	start := time.Now()
-	if r.URL.Path == "/metrics" {
-		// Should be handled above; just in case
-		promhttp.Handler().ServeHTTP(w, r)
-		return
-	}
 
 	// Read request body (if any) for forwarding and possibly to inspect model parameter
 	var bodyBytes []byte
@@ -154,7 +225,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Variables for metrics/logging
 	var modelName string
 	var promptCount, generatedCount int
-	var evalDurationNs int64
+	// var evalDurationNs int64
 
 	if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
 		// Handle streaming JSON response for generate/chat
@@ -194,7 +265,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			// This is a models list response, not a typical generate response
 			for _, model := range modelsResp.Models {
 				modelName = ensureModelTag(model.Model)
-				modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
+				modelRAM.Record(ctx, model.SizeVRAM, metric.WithAttributes(attribute.String("model.name", modelName)))
 			}
 			log.Printf("Received models list response with %d models", len(modelsResp.Models))
 			// No token counts for models list response
@@ -223,9 +294,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 					if res.EvalCount != nil {
 						generatedCount = *res.EvalCount
 					}
-					if res.EvalDuration != nil {
-						evalDurationNs = *res.EvalDuration
-					}
+				// 	if res.EvalDuration != nil {
+				// 		evalDurationNs = *res.EvalDuration
+				// 	}
 				}
 			}
 		}
@@ -235,19 +306,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write(bodyData) // write response to client
 		var ps psResponse
 		if err := json.Unmarshal(bodyData, &ps); err == nil {
-			loadedModelsGauge.Set(float64(len(ps.Models)))
-			loadedModelInfo.Reset()
-			modelRAMUsage.Reset() // Reset RAM usage before updating
+			loadedModels.Record(ctx, int64(len(ps.Models)))
 			
 			// Update model metrics directly from ps response
 			for _, m := range ps.Models {
 				modelName := ensureModelTag(m.Name)
-				loadedModelInfo.WithLabelValues(modelName).Set(1)
-				
-					// Convert size from bytes to megabytes
-				ramMB := float64(m.Size) / (1024 * 1024)
-				modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
-				log.Printf("Model %s RAM usage: %.2f MB", modelName, ramMB)
+				modelRAM.Record(ctx, m.Size, metric.WithAttributes(attribute.String("model.name", modelName)))
+
+				log.Printf("Model %s RAM usage: %.2f Bytes", modelName, m.Size)
 			}
 		} else {
 			log.Printf("ERROR parsing /api/ps response: %v", err)
@@ -272,24 +338,22 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Update Prometheus metrics if applicable
 	if modelName != "" {
 		if promptCount > 0 {
-			promptTokens.WithLabelValues(modelName).Add(float64(promptCount))
+			promptTokens.Add(ctx, int64(promptCount), metric.WithAttributes(attribute.String("model.name", modelName)))
 		}
 		if generatedCount > 0 {
-			generatedTokens.WithLabelValues(modelName).Add(float64(generatedCount))
+			generatedTokens.Add(ctx, int64(generatedCount), metric.WithAttributes(attribute.String("model.name", modelName)))
 		}
-		durationSec := time.Since(start).Seconds()
-		endpoint := strings.TrimPrefix(r.URL.Path, "/api/")
-		if endpoint == "" {
-			endpoint = r.URL.Path
-		}
-		requestDuration.WithLabelValues(endpoint, modelName).Observe(durationSec)
-		if generatedCount > 0 && evalDurationNs > 0 {
-			// evalDurationNs is in nanoseconds
-			secondsPerToken := float64(evalDurationNs) / 1e9 / float64(generatedCount)
-			timePerToken.WithLabelValues(modelName).Observe(secondsPerToken)
-		}
-		// Removed the redundant /api/ps call for /api/generate and /api/chat endpoints
-		// Model metrics are now refreshed on every /metrics request
+		// durationSec := time.Since(start).Seconds()
+		// endpoint := strings.TrimPrefix(r.URL.Path, "/api/")
+		// if endpoint == "" {
+		// 	endpoint = r.URL.Path
+		// }
+		// requestDuration.WithLabelValues(endpoint, modelName).Observe(durationSec)
+		// if generatedCount > 0 && evalDurationNs > 0 {
+		// 	// evalDurationNs is in nanoseconds
+		// 	secondsPerToken := float64(evalDurationNs) / 1e9 / float64(generatedCount)
+		// 	timePerToken.WithLabelValues(modelName).Observe(secondsPerToken)
+		// }
 	}
 
 	// Logging
