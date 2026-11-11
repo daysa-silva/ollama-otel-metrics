@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -131,20 +129,6 @@ func main() {
 
 	log.Printf("Starting Ollama proxy sidecar, forwarding to %s", upstreamAddr)
 
-	// Optionally, initialize the loaded models gauge at startup
-	if resp, err := upstreamClient.Get(upstreamAddr + "/api/ps"); err == nil {
-		var ps psResponse
-		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if jsonErr := json.Unmarshal(data, &ps); jsonErr == nil {
-			loadedModelsGauge.Set(float64(len(ps.Models)))
-			loadedModelInfo.Reset()
-			for _, m := range ps.Models {
-				loadedModelInfo.WithLabelValues(ensureModelTag(m.Name)).Set(1)
-			}
-		}
-	}
-
 	// Start HTTP server.
 	listenAddr := ":" + port
 	srv := &http.Server{
@@ -154,8 +138,32 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 		Handler:      newHTTPHandler(),
 	}
-	log.Printf("Listening on %s", listenAddr)
-	log.Fatal(srv.ListenAndServe())
+	srvErr := make(chan error, 1)
+	go func() {
+		log.Printf("Listening on %s", listenAddr)
+		srvErr <- srv.ListenAndServe()
+	}()
+
+	// Wait for interruption.
+	select {
+	case err = <-srvErr:
+		// Error when starting HTTP server.
+		if err != nil {
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		// Wait for first CTRL+C.
+		// Stop receiving signal notifications as soon as possible.
+		stop()
+	}
+
+	// When Shutdown is called, ListenAndServe immediately returns ErrServerClosed.
+	err = srv.Shutdown(context.Background())
+	if err != nil {
+
+		// Error when starting HTTP server.
+		log.Fatal(err)
+	}
 }
 
 func newHTTPHandler() http.Handler {

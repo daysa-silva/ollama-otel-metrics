@@ -1,7 +1,14 @@
-version: '3.8'
-
 services:
-
+  ollama:
+    container_name: ollama
+    image: docker.io/ollama/ollama:latest
+    restart: always
+    ports:
+      - 11434:11434
+    tty: true
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0
   otel-collector:
     container_name: otel-collector
     image: otel/opentelemetry-collector

@@ -80,6 +80,8 @@ This will start:
 
 ![grafana dashboard](.docs/dashboard.png)
 
+You can find the dashboard [Ollama OpenTelemetry Metrics](dashboards/ollama-metrics.json) in the `dashboards` folders.
+
 ## License
 
 [MIT License](LICENSE)
