@@ -13,7 +13,7 @@ RUN go mod download
 COPY main.go .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ollama-metrics .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ollama-opentelemetry-metrics .
 
 # Final stage
 FROM scratch
@@ -22,4 +22,4 @@ FROM scratch
 COPY --from=builder /app/main /main
 
 # Command to run
-ENTRYPOINT ["/ollama-metrics"]
+ENTRYPOINT ["/ollama-opentelemetry-metrics"]
